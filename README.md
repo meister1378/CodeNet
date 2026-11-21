@@ -104,16 +104,16 @@ on the image; right: the same people on the ground plane (10 m rings, camera at 
 
 <div align="center">
   <img src="results/images/parade_aerial.jpg" width="95%"/>
-  <img src="results/images/market_street.jpg" width="70%"/>
-  <img src="results/images/chariot_festival.jpg" width="70%"/>
+  <img src="results/images/street_festival.jpg" width="95%"/>
+  <img src="results/images/market_street.jpg" width="60%"/>
 </div>
 
-### Videos (5 s, 50 fps)
+### Videos (5 s)
 
 | Scene | Input | CoDE-Net |
 |---|---|---|
-| Street festival, elevated camera | [street_festival_input.mp4](results/videos/street_festival_input.mp4) | [street_festival_codenet.mp4](results/videos/street_festival_codenet.mp4) |
-| Parade, aerial | [parade_aerial_input.mp4](results/videos/parade_aerial_input.mp4) | [parade_aerial_codenet.mp4](results/videos/parade_aerial_codenet.mp4) |
+| Parade, aerial (50 fps) | [parade_aerial_input.mp4](results/videos/parade_aerial_input.mp4) | [parade_aerial_codenet.mp4](results/videos/parade_aerial_codenet.mp4) |
+| Market street, elevated camera (60 fps) | [market_street_input.mp4](results/videos/market_street_input.mp4) | [market_street_codenet.mp4](results/videos/market_street_codenet.mp4) |
 
 Rendered with `--fixed-camera --camera-window 15`.
 
@@ -173,5 +173,4 @@ Training data (training code in a separate repository): NWPU-Crowd, ShanghaiTech
 private CCTV recordings with pseudo-labels. Several of these datasets are licensed for non-commercial use
 only; check their terms before any commercial use of the weights.
 
-Demo footage in `results/`: free stock crowd videos (IDs 15544657, 17178494, 14931663, 15739574), not used in
-training.
+Demo footage in `results/`: free stock crowd videos (IDs 15544657, 17178494, 14931663), not used in training.
