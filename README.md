@@ -68,8 +68,8 @@ res = pred(bgr)     # uv (px), bev (m), camera, labels, clusters (count, area m2
 
 Videos (5 s): [parade input](results/videos/parade_aerial_input.mp4) /
 [parade CoDE-Net](results/videos/parade_aerial_codenet.mp4),
-[market input](results/videos/market_street_input.mp4) /
-[market CoDE-Net](results/videos/market_street_codenet.mp4)
+[street festival input](results/videos/street_festival_input.mp4) /
+[street festival CoDE-Net](results/videos/street_festival_codenet.mp4)
 
 | | Value |
 |---|---|
