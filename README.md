@@ -5,7 +5,7 @@ uncalibrated RGB frame. Heads, camera (FoV, tilt, height) and per-person distanc
 people are then grouped into crowd clusters with area and density.
 
 - 4.74M parameters
-- 189 FPS (TensorRT FP16, 1280x704, 24 GB GPU); 28-50 FPS end-to-end in PyTorch incl. clustering
+- 189 FPS (TensorRT FP16, 1280x704, 24 GB GPU); 18-50 FPS end-to-end in PyTorch incl. clustering
 - No calibration, homography or per-site setup
 
 ## Architecture

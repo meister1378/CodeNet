@@ -8,7 +8,9 @@ Clustering (DBSCAN with an uncertainty-aware metric)
     clusters grow only through core people, so a single person in between does not chain two groups.
     Clusters wider than split_extent are split at density valleys: on a smoothed BEV density map every peak
     owns a basin; neighbouring basins stay together unless the density between them drops below split_valley x
-    the lower peak (a uniformly dense crowd stays one cluster, two groups joined by a thin band are separated).
+    the lower peak (two groups joined by a thin band are separated). A uniformly dense crowd that is still wider
+    than max_extent is then partitioned into compact neighbouring groups of about group_area m^2 (k-means on the
+    ground plane), so area and density are reported per local group rather than for a whole plaza.
     The pair test runs on the GPU in row chunks when a CUDA device is given (thousands of people in ~1 ms);
     on the CPU, candidates come from a KD-tree with a per-person radius eps * sqrt(1 + s_i^2), which contains
     every pair with m <= eps, and the exact metric is evaluated on those candidates only.
@@ -17,7 +19,7 @@ Polygons
     BEV: union of discs (margin metres) around the members, closed by `close` metres, rasterised on a small
     per-cluster grid (cell metres). The area of that region is the occupied area used for the density.
     Image: discs of `margin` metres (at each person's distance) around the detected head pixels, closed at the
-    same scale, rasterised per cluster on a down-scaled ROI. Built from the pixels (not from the projected BEV
+    same scale, on one down-scaled raster; overlaps between clusters are split by the nearest head. Built from the pixels (not from the projected BEV
     outline), so the outline stays on the people even where the metric position is off.
 """
 from __future__ import annotations
@@ -46,6 +48,8 @@ class ClusterCfg:
     split_valley: float = 0.7  # merge two density peaks if the valley between them is >= this x the lower peak
     split_sigma: float = 1.5  # smoothing of the BEV density map (m) - the scale of the parts
     split_cell: float = 0.5   # density map cell (m)
+    max_extent: float = 12.0  # crowds still wider than this (m) are partitioned into compact groups (0 = off)
+    group_area: float = 80.0  # target occupied area of one such group (m^2)
     margin: float = 0.8       # polygon margin around people (m)
     close: float = 0.8        # morphological closing of the BEV region (m)
     cell: float = 0.2         # BEV raster cell (m)
@@ -247,6 +251,45 @@ def _density_split(idx, bev, cfg):
     return [idx[lab == q] for q in np.unique(lab)]
 
 
+def _size_split(idx, bev, cfg):
+    """Partition a crowd wider than max_extent into compact groups of about group_area m^2 (k-means on the
+    ground plane, farthest-point initialisation, deterministic). Used where a crowd is uniformly dense and has no
+    density valley to split at, so that one plaza-wide crowd is reported as neighbouring groups."""
+    P = bev[idx]
+    if np.ptp(P, 0).max() <= cfg.max_extent:
+        return [idx]
+    c = 1.0
+    g = np.unique(np.floor(P / c).astype(np.int64), axis=0)           # occupied 1 m cells
+    k = int(min(len(idx) // max(cfg.min_people, 1), max(2, math.ceil(len(g) * c * c / cfg.group_area))))
+    if k < 2:
+        return [idx]
+    cen = [P[np.argmin(P[:, 1])]]                                       # nearest person first
+    dmin = np.full(len(P), np.inf)
+    for _ in range(k - 1):
+        dmin = np.minimum(dmin, ((P - cen[-1]) ** 2).sum(1))
+        cen.append(P[np.argmax(dmin)])
+    cen = np.array(cen)
+    for _ in range(15):
+        lab = ((P[:, None] - cen[None]) ** 2).sum(-1).argmin(1)
+        new = np.array([P[lab == j].mean(0) if (lab == j).any() else cen[j] for j in range(k)])
+        if np.allclose(new, cen, atol=1e-3):
+            break
+        cen = new
+    lab = ((P[:, None] - cen[None]) ** 2).sum(-1).argmin(1)
+    # parts below min_people join the nearest other centre
+    while True:
+        cnt = np.bincount(lab, minlength=k)
+        small = [j for j in range(k) if 0 < cnt[j] < cfg.min_people]
+        if not small:
+            break
+        j = small[0]
+        dd = ((cen - cen[j]) ** 2).sum(1)
+        dd[j] = np.inf
+        dd[cnt == 0] = np.inf
+        lab[lab == j] = int(np.argmin(dd))
+    return [idx[lab == j] for j in np.unique(lab)]
+
+
 def cluster_people(bev: np.ndarray, sigma: np.ndarray, cfg: ClusterCfg = ClusterCfg(), device=None) -> np.ndarray:
     """Cluster label per person (-1 = not in a cluster of >= min_people). device: torch CUDA device for the
     pair test (fast for thousands of people); None = CPU KD-tree."""
@@ -262,7 +305,10 @@ def cluster_people(bev: np.ndarray, sigma: np.ndarray, cfg: ClusterCfg = Cluster
         idx = np.flatnonzero(raw == c)
         if len(idx) >= cfg.min_people:
             big = cfg.split_valley < 1.0 and np.ptp(bev[idx], 0).max() > cfg.split_extent
-            groups += _density_split(idx, bev, cfg) if big else [idx]
+            parts = _density_split(idx, bev, cfg) if big else [idx]
+            if cfg.max_extent > 0:
+                parts = [q for part in parts for q in _size_split(part, bev, cfg)]
+            groups += parts
     groups.sort(key=lambda g: -len(g))
     for k, g in enumerate(groups):
         lab[g] = k
@@ -298,20 +344,50 @@ def build_clusters(bev, sigma, uv, cam, img_wh, net_wh, cfg: ClusterCfg = Cluste
         area = float(m.sum()) * cfg.cell * cfg.cell
         cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         bev_polys = [cv2.approxPolyDP(q, 0.75, True)[:, 0].astype(np.float64) * cfg.cell + o for q in cs if len(q) >= 3]
-        # ---- image overlay: discs of `margin` metres (at each person's distance) around the detected head pixels,
-        # closed at the same scale. Drawn from the pixels only, so a person whose metric position is off (camera
-        # error, people above the ground plane) still gets the outline at the right place in the image.
-        U = uv[mem]
-        dist3 = np.sqrt((P ** 2).sum(1) + drop ** 2)
-        rpx = np.clip(f_img * cfg.margin / dist3, 3.0, 0.25 * max(W, H))
-        lo = np.floor(U.min(0) - rpx.max()).clip(0, [W - 1, H - 1])
-        hi = np.ceil(U.max(0) + rpx.max()).clip(0, [W - 1, H - 1])
-        ds = max(cfg.img_ds, int(round(max(W, H) / 480)))
-        sh = (int((hi[1] - lo[1]) / ds) + 2, int((hi[0] - lo[0]) / ds) + 2)
-        mi = _disc_mask(U, rpx, lo, ds, sh)
-        kc = max(1, int(round(float(np.median(rpx)) / ds)))
-        mi = cv2.morphologyEx(mi, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * kc + 1,) * 2))
-        cs, _ = cv2.findContours(mi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        img_polys = [np.round(cv2.approxPolyDP(q, 0.6, True)[:, 0] * ds + lo).astype(np.int32) for q in cs if len(q) >= 3]
-        out.append(Cluster(members=mem, area=area, bev_polys=bev_polys, img_polys=img_polys))
+        out.append(Cluster(members=mem, area=area, bev_polys=bev_polys, img_polys=[]))
+    _image_polygons(out, uv, bev, f_img, drop, (W, H), cfg)
     return labels, out
+
+
+def _image_polygons(clusters, uv, bev, f_img, drop, img_wh, cfg):
+    """Image overlay regions that tile without overlap.
+
+    Each cluster: discs of `margin` metres (at each person's distance) around its detected head pixels, closed
+    at the same scale, on one down-scaled full-image raster. Drawn from the pixels, so a person whose metric
+    position is off still gets the outline at the right place. Where regions of neighbouring clusters overlap,
+    every raster cell goes to the cluster of the nearest clustered head (Voronoi split), so adjacent groups of a
+    partitioned crowd share a border instead of covering each other."""
+    if not clusters:
+        return
+    W, H = img_wh
+    ds = max(cfg.img_ds, int(round(max(W, H) / 480)))
+    gh, gw = H // ds + 1, W // ds + 1
+    own = np.full((gh, gw), -1, np.int32)
+    nown = np.zeros((gh, gw), np.uint8)
+    regs = []
+    for k, c in enumerate(clusters):
+        U, P = uv[c.members], bev[c.members]
+        rpx = np.clip(f_img * cfg.margin / np.sqrt((P ** 2).sum(1) + drop ** 2), 3.0, 0.25 * max(W, H))
+        kc = max(1, int(round(float(np.median(rpx)) / ds)))
+        pad = int(math.ceil(rpx.max() / ds)) + kc + 2               # region of interest on the raster
+        x0, y0 = (np.floor(U.min(0) / ds) - pad).astype(int).clip(0, [gw - 1, gh - 1])
+        x1, y1 = (np.ceil(U.max(0) / ds) + pad).astype(int).clip(0, [gw - 1, gh - 1])
+        roi = _disc_mask(U, rpx, np.array([x0, y0]) * ds, ds, (y1 - y0 + 1, x1 - x0 + 1))
+        roi = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * kc + 1,) * 2))
+        m = np.zeros((gh, gw), np.uint8)
+        m[y0:y1 + 1, x0:x1 + 1] = roi
+        regs.append(m)
+        own[m > 0] = k
+        nown += m
+    over = nown > 1
+    if over.any():
+        idx = np.concatenate([c.members for c in clusters])
+        lab = np.concatenate([np.full(len(c.members), k) for k, c in enumerate(clusters)])
+        yy, xx = np.nonzero(over)
+        _, nn = cKDTree(uv[idx] / ds).query(np.stack([xx, yy], 1))
+        own[yy, xx] = lab[nn]
+    for k, c in enumerate(clusters):
+        m = ((own == k) & (regs[k] > 0)).astype(np.uint8)
+        cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        c.img_polys = [np.round(cv2.approxPolyDP(q, 0.6, True)[:, 0] * ds).astype(np.int32) for q in cs
+                       if len(q) >= 3 and cv2.contourArea(q) >= 2]
