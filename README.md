@@ -28,7 +28,7 @@ area and density, drawn both on the top view (BEV) and back on the image.
 - **Post-processing**: DBSCAN on the ground plane with an uncertainty-aware metric (the radial separation is
   divided by the person's distance uncertainty, capped), then large crowds are split at density valleys of a
   smoothed BEV density map (two groups joined by a thin band become separate clusters; a uniformly dense crowd
-  stays one). Metric polygons, area and density, polygons projected back onto the image. GPU pair test;
+  stays one). Metric polygons, area and density; image outlines drawn around the detected heads. GPU pair test;
   ~10-25 ms for 1,000-2,300 people.
 
 ## Structure
@@ -151,11 +151,16 @@ export with `cfg.topk = 3840` or decode outside the engine for larger crowds.
 
 ## Limitations
 
-- The ground is assumed flat. Tiered seating (stadiums, arenas) and stairs bend the top view.
+- The ground is assumed flat and every head 1.65 m above it. People on rooftops, balconies, tiered seating or
+  stairs get a wrong top-view position (usually left out of clusters or placed too far).
+- False detections on strongly textured roofs (e.g. clay roof tiles seen from a drone) can form small clusters.
+- The camera tilt of portrait (vertical) drone frames tends to be under-estimated; far people then lie above
+  the estimated horizon and keep only the learned distance.
 - Very oblique long-range aerial shots (horizon in view, crowd > 100 m away) are under-estimated in
   distance; the training drones look down steeply.
 - Pinhole camera model; strong fisheye distortion shifts positions near the image border.
-- The camera is estimated per frame; use `--fixed-camera` (or `--camera`) for static cameras.
+- The camera is estimated per frame; use `--fixed-camera` for static cameras, or `--camera` when the
+  camera is known (fixes the two points above for that camera).
 
 ## License
 

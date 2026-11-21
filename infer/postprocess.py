@@ -16,9 +16,9 @@ Clustering (DBSCAN with an uncertainty-aware metric)
 Polygons
     BEV: union of discs (margin metres) around the members, closed by `close` metres, rasterised on a small
     per-cluster grid (cell metres). The area of that region is the occupied area used for the density.
-    Image: the BEV outline projected at head height, united with discs of `margin` metres (at each person's
-    distance) around the detected head pixels, so every member lies inside the drawn polygon even where the
-    monocular BEV position and the pixel disagree by a few pixels. Rasterised per cluster on a down-scaled ROI.
+    Image: discs of `margin` metres (at each person's distance) around the detected head pixels, closed at the
+    same scale, rasterised per cluster on a down-scaled ROI. Built from the pixels (not from the projected BEV
+    outline), so the outline stays on the people even where the metric position is off.
 """
 from __future__ import annotations
 
@@ -298,22 +298,17 @@ def build_clusters(bev, sigma, uv, cam, img_wh, net_wh, cfg: ClusterCfg = Cluste
         area = float(m.sum()) * cfg.cell * cfg.cell
         cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         bev_polys = [cv2.approxPolyDP(q, 0.75, True)[:, 0].astype(np.float64) * cfg.cell + o for q in cs if len(q) >= 3]
-        # ---- image overlay: projected BEV outline (head height) U discs around the detected heads
+        # ---- image overlay: discs of `margin` metres (at each person's distance) around the detected head pixels,
+        # closed at the same scale. Drawn from the pixels only, so a person whose metric position is off (camera
+        # error, people above the ground plane) still gets the outline at the right place in the image.
         U = uv[mem]
         dist3 = np.sqrt((P ** 2).sum(1) + drop ** 2)
         rpx = np.clip(f_img * cfg.margin / dist3, 3.0, 0.25 * max(W, H))
-        proj = []
-        for q in bev_polys:                             # a pinhole maps straight plane edges to straight lines
-            pix, ok = world_to_pixel(q[:, 0], np.full(len(q), drop), q[:, 1], cam, img_wh, net_wh)
-            if ok.all():
-                proj.append(pix)
-        lo = np.floor(np.min([U.min(0) - rpx.max()] + [p.min(0) for p in proj], 0)).clip(0, [W - 1, H - 1])
-        hi = np.ceil(np.max([U.max(0) + rpx.max()] + [p.max(0) for p in proj], 0)).clip(0, [W - 1, H - 1])
+        lo = np.floor(U.min(0) - rpx.max()).clip(0, [W - 1, H - 1])
+        hi = np.ceil(U.max(0) + rpx.max()).clip(0, [W - 1, H - 1])
         ds = max(cfg.img_ds, int(round(max(W, H) / 480)))
         sh = (int((hi[1] - lo[1]) / ds) + 2, int((hi[0] - lo[0]) / ds) + 2)
         mi = _disc_mask(U, rpx, lo, ds, sh)
-        for p in proj:
-            cv2.fillPoly(mi, [np.round((np.clip(p, lo, hi) - lo) / ds).astype(np.int32)], 1)
         kc = max(1, int(round(float(np.median(rpx)) / ds)))
         mi = cv2.morphologyEx(mi, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * kc + 1,) * 2))
         cs, _ = cv2.findContours(mi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
