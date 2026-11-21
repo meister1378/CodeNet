@@ -6,7 +6,7 @@ height) and places each person on the ground in metres. People are then grouped 
 area and density, drawn both on the top view (BEV) and back on the image.
 
 - 4.74M parameters, one forward pass, no calibration or homography
-- 189 FPS network-only (TensorRT FP16, 1280x704, RTX 3090); 33-53 FPS end-to-end in PyTorch incl. clustering
+- 189 FPS network-only (TensorRT FP16, 1280x704, RTX 3090); 28-50 FPS end-to-end in PyTorch incl. clustering
 - Median distance error 14-41 % on held-out drone video from 4 m to 100 m camera height
 
 ## Architecture
@@ -26,8 +26,10 @@ area and density, drawn both on the top view (BEV) and back on the image.
   intersection (precise for steep rays) with the learned distance (the only cue near the horizon) by
   inverse variance, so far people keep a position and an uncertainty.
 - **Post-processing**: DBSCAN on the ground plane with an uncertainty-aware metric (the radial separation is
-  divided by the person's distance uncertainty), metric polygons, area and density, polygons projected back
-  onto the image. GPU pair test; ~5-15 ms for 1,000-2,300 people.
+  divided by the person's distance uncertainty, capped), then large crowds are split at density valleys of a
+  smoothed BEV density map (two groups joined by a thin band become separate clusters; a uniformly dense crowd
+  stays one). Metric polygons, area and density, polygons projected back onto the image. GPU pair test;
+  ~10-25 ms for 1,000-2,300 people.
 
 ## Structure
 
@@ -90,8 +92,10 @@ res['clusters']    # count, area (m2), density (people / m2), BEV polygons (m), 
 
 The JSON written by the CLI has the same content (`camera`, `people`, `clusters`).
 
-Clustering parameters (`ClusterCfg` in `postprocess.py`): neighbour distance `eps` 1.5 m, `min_nb` 2
-neighbours for a core person, `min_people` 5, polygon margin 0.8 m.
+Clustering parameters (`ClusterCfg` in `postprocess.py`): neighbour distance `eps` 1.5 m, `min_nb` 3
+neighbours for a core person, `min_people` 5; clusters wider than `split_extent` 10 m are split where the
+density drops below `split_valley` 0.7 x the lower peak (density map smoothed by `split_sigma` 1.5 m);
+polygon margin 0.8 m. Lower `split_valley` / larger `split_sigma` give fewer, larger clusters.
 
 ## Results
 
@@ -140,7 +144,7 @@ binned by camera height; median per-person distance error against the geometry t
 | Network, TensorRT FP16 | 5.3 ms (189 FPS) | 3.3 ms (302 FPS) |
 | Network, PyTorch | 6.0 ms | 6.3 ms |
 | Pre-processing + network, PyTorch (4K / 2.5K video frame) | 11.5-13.8 ms | |
-| + clustering and polygons (1,000-2,300 people) | +7-17 ms | |
+| + clustering and polygons (1,000-2,300 people) | +9-23 ms | |
 
 The network time includes decoding and the metric lift. TensorRT 8.5 limits in-graph top-K to 3840 people;
 export with `cfg.topk = 3840` or decode outside the engine for larger crowds.
