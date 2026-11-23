@@ -2,7 +2,7 @@
 
 **CoDE-Net (Crowd of Depth Estimation Net)**: every person's metric position on the ground from a single
 uncalibrated RGB frame. Heads, camera (FoV, tilt, height) and per-person distance come out of one forward pass;
-people are then grouped into crowd clusters with area and density.
+people are then grouped into crowd clusters with area, density and a risk level (safe / caution / warning).
 
 - 4.74M parameters
 - 189 FPS (TensorRT FP16, 1280x704, 24 GB GPU); 18-50 FPS end-to-end in PyTorch incl. clustering
@@ -49,14 +49,19 @@ export CKPT_KEY=<key>
 ```bash
 cd infer
 python infer.py image.jpg --out out/                  # overlay | top view (.jpg) + people / clusters (.json)
-python infer.py video.mp4 --out out/ --fixed-camera   # static camera: camera = running median over frames
+python infer.py video.mp4 --out out/ --fixed-camera   # static camera: median camera + temporally stable clusters
+python infer.py video.mp4 --out out/ --risk 2 4       # density thresholds (people/m2) for caution / warning
 ```
+
+Cluster colours: green < 2, yellow 2-4, red >= 4 people/m2. For a static camera (`--fixed-camera` or `--camera`) the
+clusters are tracked: the last 8 frames are clustered together, group centres persist with a track id, and density
+and risk level are smoothed with hysteresis (`--no-track` to disable; not for moving cameras).
 
 ```python
 from infer import CodeNetPredictor
 
 pred = CodeNetPredictor('../checkpoints/codenet_m.pth.enc')
-res = pred(bgr)     # uv (px), bev (m), camera, labels, clusters (count, area m2, density, polygons)
+res = pred(bgr)     # uv (px), bev (m), camera, labels, clusters (count, area m2, density, level, polygons)
 ```
 
 ## Results

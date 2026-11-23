@@ -29,8 +29,9 @@ sys.path.insert(0, os.path.join(_HERE, "..", "model"))
 sys.path.insert(0, _HERE)
 from ckpt_crypto import load_checkpoint  # noqa: E402
 from model import CodeNet  # noqa: E402
-from postprocess import CameraSmoother, ClusterCfg, build_clusters  # noqa: E402
+from postprocess import CameraSmoother, ClusterCfg, ClusterTracker, TrackCfg, build_clusters  # noqa: E402
 from visualize import BevCanvas, cluster_table, compose, draw_overlay  # noqa: E402
+import visualize as vis  # noqa: E402
 
 MEAN = np.array([0.485, 0.456, 0.406], np.float32)
 STD = np.array([0.229, 0.224, 0.225], np.float32)
@@ -43,10 +44,13 @@ class CodeNetPredictor:
     long_side: network input long side (rounded to /32). thr: detection score threshold.
     fixed_camera: median of the camera estimate over the last `camera_window` frames is used for the lift
     (static camera, video). camera: optional fixed (fov, pitch, roll, height) [rad, rad, rad, m] override.
+    track: temporally stable clustering for consecutive frames of a static camera (ClusterTracker); call
+    reset() between unrelated videos.
     """
 
     def __init__(self, ckpt_path, device="cuda", preset="m", thr=0.3, long_side=1280, fp16=True,
-                 fixed_camera=False, camera_window=25, camera=None, cluster_cfg: ClusterCfg | None = None):
+                 fixed_camera=False, camera_window=25, camera=None, cluster_cfg: ClusterCfg | None = None,
+                 track=False, track_cfg: TrackCfg | None = None):
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.fp16 = fp16 and self.device.type == "cuda"
         net = CodeNet(preset)
@@ -58,6 +62,8 @@ class CodeNetPredictor:
         self._mean = torch.tensor(MEAN, device=self.device).view(1, 3, 1, 1)
         self._std = torch.tensor(STD, device=self.device).view(1, 3, 1, 1)
         self.cluster_cfg = cluster_cfg or ClusterCfg()
+        self.track_cfg = track_cfg or TrackCfg()
+        self.tracker = ClusterTracker(self.cluster_cfg, self.track_cfg, self.device) if track else None
         self.smoother = CameraSmoother(camera_window) if fixed_camera else None
         self.camera_fixed = None if camera is None else np.asarray(camera, np.float64)
         self._cam_raw = None
@@ -102,11 +108,24 @@ class CodeNetPredictor:
                 "camera": cam[0].float().cpu().numpy().astype(np.float64), "camera_raw": self._cam_raw,
                 "img_wh": (W, H), "net_wh": (nw, nh)}
 
-    def __call__(self, bgr):
-        r = self.detect(bgr)
-        r["labels"], r["clusters"] = build_clusters(r["bev"], r["sigma"], r["uv"], r["camera"], r["img_wh"],
-                                                    r["net_wh"], self.cluster_cfg, self.device)
+    def reset(self):
+        if self.tracker is not None:
+            self.tracker = ClusterTracker(self.cluster_cfg, self.track_cfg, self.device)
+        if self.smoother is not None:
+            self.smoother = CameraSmoother(self.smoother.buf.maxlen)
+
+    def cluster(self, r):
+        """Adds labels / clusters (tracked when track=True) and the risk thresholds to a detect() result."""
+        if self.tracker is not None:
+            r["labels"], r["clusters"] = self.tracker(r["bev"], r["sigma"], r["uv"], r["camera"], r["img_wh"])
+        else:
+            r["labels"], r["clusters"] = build_clusters(r["bev"], r["sigma"], r["uv"], r["camera"], r["img_wh"],
+                                                        r["net_wh"], self.cluster_cfg, self.device)
+        r["risk"] = tuple(self.cluster_cfg.risk)
         return r
+
+    def __call__(self, bgr):
+        return self.cluster(self.detect(bgr))
 
 
 def to_json(r):
@@ -116,7 +135,7 @@ def to_json(r):
             "people": [{"u": float(u), "v": float(v), "score": float(s), "x_m": float(b[0]), "z_m": float(b[1]),
                         "log_sigma": float(sg), "cluster": int(l)}
                        for (u, v), s, b, sg, l in zip(r["uv"], r["score"], r["bev"], r["sigma"], r["labels"])],
-            "clusters": [{"id": k + 1, "count": c.count, "area_m2": c.area, "density_per_m2": c.density,
+            "clusters": [{"id": k + 1, "count": c.count, "area_m2": c.area, "density_per_m2": c.rho, "level": vis.LEVEL_NAME[c.level], "track_id": c.tid,
                           "polygon_m": [p.round(2).tolist() for p in c.bev_polys],
                           "polygon_px": [p.tolist() for p in c.img_polys]} for k, c in enumerate(r["clusters"])]}
 
@@ -124,7 +143,8 @@ def to_json(r):
 def render(r, img, canvas: BevCanvas, title=""):
     ov = draw_overlay(img, r["uv"], r["labels"], r["clusters"])
     bv = canvas.fit(r["bev"]).draw(r["bev"], r["labels"], r["clusters"], r["camera"])
-    return compose(ov, bv, cluster_table(r["clusters"], len(r["uv"])), title or "top view (BEV)", r["camera"])
+    return compose(ov, bv, cluster_table(r["clusters"], len(r["uv"])), title or "top view (BEV)", r["camera"],
+                   r.get("risk", (2.0, 4.0)))
 
 
 def run_images(pred, paths, out, size):
@@ -156,8 +176,7 @@ def run_video(pred, path, out, size, start=0.0, seconds=None):
         if pred.device.type == "cuda":
             torch.cuda.synchronize()
         t1 = time.time()
-        r["labels"], r["clusters"] = build_clusters(r["bev"], r["sigma"], r["uv"], r["camera"], r["img_wh"],
-                                                    r["net_wh"], pred.cluster_cfg, pred.device)
+        pred.cluster(r)
         t2 = time.time()
         if n >= 3:                                     # skip warm-up frames in the timing
             t_net, t_all = t_net + (t1 - t0), t_all + (t2 - t0)
@@ -191,6 +210,10 @@ def main():
     ap.add_argument("--start", type=float, default=0.0, help="video start (s)")
     ap.add_argument("--seconds", type=float, default=None, help="video duration (s)")
     ap.add_argument("--bev-size", type=int, default=720)
+    ap.add_argument("--risk", type=float, nargs=2, default=[2.0, 4.0], metavar=("CAUTION", "WARNING"),
+                    help="cluster density thresholds (people/m2) for caution / warning colours")
+    ap.add_argument("--no-track", action="store_true",
+                    help="cluster every video frame independently (default with --fixed-camera / --camera: tracked)")
     ap.add_argument("--cpu", action="store_true")
     a = ap.parse_args()
     cam = None
@@ -198,8 +221,10 @@ def main():
         cam = [math.radians(a.camera[0]), math.radians(a.camera[1]), math.radians(a.camera[2]), a.camera[3]]
     src = Path(a.input)
     video = src.is_file() and src.suffix.lower() not in IMG_EXT
+    track = video and (a.fixed_camera or cam is not None) and not a.no_track
     pred = CodeNetPredictor(a.ckpt, device="cpu" if a.cpu else "cuda", thr=a.thr, long_side=a.long_side,
-                            fixed_camera=a.fixed_camera, camera_window=a.camera_window, camera=cam)
+                            fixed_camera=a.fixed_camera, camera_window=a.camera_window, camera=cam,
+                            cluster_cfg=ClusterCfg(risk=tuple(a.risk)), track=track)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     if video:

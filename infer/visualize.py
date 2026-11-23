@@ -6,14 +6,20 @@ import math
 import cv2
 import numpy as np
 
-# 10 well-separated colours (BGR); clusters cycle through them, people outside clusters are grey
-PALETTE = [(180, 119, 31), (14, 127, 255), (44, 160, 44), (40, 39, 214), (189, 103, 148),
-           (75, 86, 140), (194, 119, 227), (34, 189, 188), (207, 190, 23), (127, 127, 127)]
+# Clusters are coloured by crowd risk from their density; people outside clusters are grey (BGR)
 GREY = (170, 170, 170)
+LEVEL_NAME = ("safe", "caution", "warning")
+LEVEL_COLOUR = ((60, 175, 40), (0, 200, 245), (40, 40, 220))     # green, yellow, red
 
 
-def colour(i: int):
-    return GREY if i < 0 else PALETTE[i % 9]
+def ccol(c):
+    """Colour of a cluster's risk level (Cluster.level, set by the post-processing)."""
+    return LEVEL_COLOUR[c.level]
+
+
+def _edge(col):
+    """Darker shade of the level colour for outlines, so neighbouring clusters of one level stay separable."""
+    return tuple(int(v * 0.55) for v in col)
 
 
 def _text(img, s, org, scale, colour_, thick=1, bg=None):
@@ -25,24 +31,20 @@ def _text(img, s, org, scale, colour_, thick=1, bg=None):
 
 
 def draw_overlay(img, uv, labels, clusters, alpha=0.35):
-    """Cluster polygons (filled, alpha) + head dots coloured by cluster + C<k> tags with count and density."""
+    """Cluster polygons (filled, alpha, risk colour) + head dots; no per-cluster tags."""
     out = img.copy()
     H, W = img.shape[:2]
     lw = max(1, round(max(H, W) / 900))
     fill = img.copy()
-    for k, c in enumerate(clusters):
-        cv2.fillPoly(fill, c.img_polys, colour(k))
+    for c in clusters:
+        cv2.fillPoly(fill, c.img_polys, ccol(c))
     cv2.addWeighted(fill, alpha, out, 1 - alpha, 0, out)
-    for k, c in enumerate(clusters):
-        cv2.polylines(out, c.img_polys, True, colour(k), lw + 1, cv2.LINE_AA)
+    for c in clusters:
+        cv2.polylines(out, c.img_polys, True, _edge(ccol(c)), lw + 1, cv2.LINE_AA)
     r = max(2, round(max(H, W) / 600))
     for (x, y), l in zip(uv.astype(int), labels):
-        cv2.circle(out, (int(x), int(y)), r, colour(int(l)), -1, cv2.LINE_AA)
+        cv2.circle(out, (int(x), int(y)), r, GREY if l < 0 else ccol(clusters[int(l)]), -1, cv2.LINE_AA)
         cv2.circle(out, (int(x), int(y)), r, (0, 0, 0), 1, cv2.LINE_AA)
-    fs = max(0.45, max(H, W) / 2600)
-    for k, c in enumerate(clusters):
-        top = c.members[np.argmin(uv[c.members, 1])]
-        _text(out, f"C{k + 1} {c.count}", (uv[top, 0] - 10, uv[top, 1] - 3 * r), fs, (255, 255, 255), max(1, lw), colour(k))
     return out
 
 
@@ -81,37 +83,49 @@ class BevCanvas:
             for q in c.bev_polys:
                 p = np.round(self.to_px(q)).astype(np.int32)
                 ov = img.copy()
-                cv2.fillPoly(ov, [p], colour(k))
-                cv2.addWeighted(ov, 0.18, img, 0.82, 0, img)
-                cv2.polylines(img, [p], True, colour(k), 1, cv2.LINE_AA)
+                cv2.fillPoly(ov, [p], ccol(c))
+                cv2.addWeighted(ov, 0.25, img, 0.75, 0, img)
+                cv2.polylines(img, [p], True, _edge(ccol(c)), 1, cv2.LINE_AA)
         P = np.round(self.to_px(bev)).astype(int) if len(bev) else np.zeros((0, 2), int)
         for (x, y), l in zip(P, labels):
             if 0 <= x < S and 0 <= y < S:
-                cv2.circle(img, (int(x), int(y)), 2, colour(int(l)), -1, cv2.LINE_AA)
-        for k, c in enumerate(clusters[:20]):
-            q = self.to_px(bev[c.members].mean(0))
-            if 0 <= q[0] < S and 0 <= q[1] < S:
-                _text(img, f"C{k + 1}", (q[0] + 6, q[1]), 0.4, (0, 0, 0))
+                cv2.circle(img, (int(x), int(y)), 2, GREY if l < 0 else ccol(clusters[int(l)]), -1, cv2.LINE_AA)
         cv2.drawMarker(img, o, (0, 0, 220), cv2.MARKER_TRIANGLE_UP, 14, 2)
         return img
 
 
 def cluster_table(clusters, n_people, max_rows=6):
-    """Fixed number of lines (constant frame size for video)."""
-    rows = [f"{n_people} people, {len(clusters)} clusters"]
-    rows += [f"C{k + 1}: {c.count:4d} people  {c.area:6.0f} m2  {c.density:4.2f}/m2" for k, c in enumerate(clusters[:max_rows])]
-    return rows + [""] * (max_rows + 1 - len(rows))
+    """Header line + the densest clusters first, as (text, swatch colour); fixed number of lines for video."""
+    n_lv = [sum(c.level == v for c in clusters) for v in range(3)]
+    inside = sum(c.count for c in clusters)
+    rows = [(f"{n_people} people ({inside} in {len(clusters)} clusters)   "
+             f"warning {n_lv[2]}  caution {n_lv[1]}  safe {n_lv[0]}", None)]
+    order = sorted(range(len(clusters)), key=lambda k: (-clusters[k].level, -clusters[k].rho))[:max_rows]
+    rows += [(f"{c.count:4d} people  {c.area:6.0f} m2  {c.rho:4.2f}/m2  {LEVEL_NAME[c.level]}",
+              ccol(c)) for k in order for c in [clusters[k]]]
+    return rows + [("", None)] * (max_rows + 1 - len(rows))
 
 
-def compose(overlay, bev_img, rows, title="top view (BEV)", cam=None):
-    """Overlay (left) | header band (title, camera, cluster table) above the BEV panel (right)."""
+def compose(overlay, bev_img, rows, title="top view (BEV)", cam=None, risk=(2.0, 4.0)):
+    """Overlay (left) | header band (title, camera, risk legend, cluster table) above the BEV panel (right)."""
     S = bev_img.shape[1]
-    lines = [title] + ([f"camera: fov {math.degrees(cam[0]):.0f} deg  tilt {math.degrees(cam[1]):.0f} deg  "
-                        f"height {cam[3]:.1f} m"] if cam is not None else []) + rows
-    band = np.full((14 + 17 * len(lines), S, 3), 255, np.uint8)
-    for i, r in enumerate(lines):
-        c = (0, 0, 0) if i == 0 else (60, 60, 60) if (cam is not None and i == 1) else (0, 0, 160) if r is rows[0] else (0, 0, 0)
-        _text(band, r, (10, 18 + 17 * i), 0.5 if i == 0 else 0.42, c, 1)
+    head = [title] + ([f"camera: fov {math.degrees(cam[0]):.0f} deg  tilt {math.degrees(cam[1]):.0f} deg  "
+                       f"height {cam[3]:.1f} m"] if cam is not None else [])
+    n = len(head) + 1 + len(rows)
+    band = np.full((14 + 17 * n, S, 3), 255, np.uint8)
+    for i, r in enumerate(head):
+        _text(band, r, (10, 18 + 17 * i), 0.5 if i == 0 else 0.42, (0, 0, 0) if i == 0 else (60, 60, 60), 1)
+    y = 18 + 17 * len(head)                                  # legend: swatch + threshold per level
+    x = 10
+    for v, s_ in enumerate((f"safe <{risk[0]:g}/m2", f"caution {risk[0]:g}-{risk[1]:g}/m2", f"warning >={risk[1]:g}/m2")):
+        cv2.rectangle(band, (x, y - 10), (x + 12, y + 1), LEVEL_COLOUR[v], -1)
+        _text(band, s_, (x + 17, y), 0.42, (40, 40, 40), 1)
+        x += 30 + cv2.getTextSize(s_, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)[0][0]
+    for i, (r, sw) in enumerate(rows):
+        y = 18 + 17 * (len(head) + 1 + i)
+        if sw is not None:
+            cv2.rectangle(band, (10, y - 10), (22, y + 1), sw, -1)
+        _text(band, r, (10 if i == 0 else 28, y), 0.42, (0, 0, 160) if i == 0 else (0, 0, 0), 1)
     right = np.concatenate([band, bev_img], 0)
     H = right.shape[0]
     h, w = overlay.shape[:2]

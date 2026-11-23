@@ -54,6 +54,7 @@ class ClusterCfg:
     close: float = 0.8        # morphological closing of the BEV region (m)
     cell: float = 0.2         # BEV raster cell (m)
     img_ds: int = 4           # min down-scaling of the image ROI raster (>= long side / 480)
+    risk: tuple = (2.0, 4.0)  # density (people / m^2) for caution / warning; below = safe
 
 
 @dataclass
@@ -62,6 +63,10 @@ class Cluster:
     area: float                            # occupied area (m^2)
     bev_polys: list = field(default_factory=list)   # list of (K,2) arrays, metres
     img_polys: list = field(default_factory=list)   # list of (K,2) int arrays, pixels
+    geo: np.ndarray | None = None          # indices of the points the region is drawn from (default: members)
+    tid: int = -1                          # track id (video tracking), -1 = untracked
+    rho: float = 0.0                       # reported density (time-smoothed when tracked)
+    level: int = 0                         # 0 safe, 1 caution, 2 warning
 
     @property
     def count(self) -> int:
@@ -70,6 +75,15 @@ class Cluster:
     @property
     def density(self) -> float:
         return self.count / max(self.area, 1e-6)
+
+
+def risk_level(rho: float, risk, prev: int | None = None, hyst: float = 0.0) -> int:
+    """Level from density; with a previous level, stepping down needs rho < (1 - hyst) x the threshold."""
+    lv = int(rho >= risk[0]) + int(rho >= risk[1])
+    if prev is not None and lv < prev:
+        lv = max(lv, int(rho >= risk[0] * (1 - hyst)) + int(rho >= risk[1] * (1 - hyst)))
+        lv = min(lv, prev)
+    return lv
 
 
 class CameraSmoother:
@@ -144,8 +158,11 @@ def _edges_torch(bev, d, s, eps, device, chunk=1024):
     return torch.cat(out_i).cpu().numpy(), torch.cat(out_j).cpu().numpy()
 
 
-def _dbscan(bev, d, s, eps, min_nb, device):
-    """Raw DBSCAN labels (-1 = noise) with the uncertainty-aware metric."""
+def _dbscan(bev, d, s, eps, min_nb, device, w=None, relax=None):
+    """Raw DBSCAN labels (-1 = noise) with the uncertainty-aware metric.
+    w: optional point weights (points pooled over K frames carry 1/K): a point is core when the weight within
+    eps, itself included, is >= min_nb + 1 (= on average >= min_nb neighbours per frame).
+    relax: optional per-point reduction of that requirement (hysteresis for people already in a cluster)."""
     n = len(bev)
     lab = -np.ones(n, np.int64)
     if n < 2:
@@ -154,8 +171,12 @@ def _dbscan(bev, d, s, eps, min_nb, device):
         ii, jj = _edges_torch(bev, d, s, eps, device)
     else:
         ii, jj = _edges_kdtree(bev, d, s, eps)
-    deg = np.bincount(ii, minlength=n) + np.bincount(jj, minlength=n)
-    core = deg >= min_nb
+    if w is None:
+        deg = np.bincount(ii, minlength=n) + np.bincount(jj, minlength=n)
+        core = deg >= min_nb
+    else:
+        deg = np.bincount(ii, weights=w[jj], minlength=n) + np.bincount(jj, weights=w[ii], minlength=n) + w
+        core = deg >= min_nb + 1 - (0.0 if relax is None else relax) - 1e-6
     cc = core[ii] & core[jj]
     if core.any():
         g = coo_matrix((np.ones(cc.sum()), (ii[cc], jj[cc])), shape=(n, n))
@@ -167,7 +188,7 @@ def _dbscan(bev, d, s, eps, min_nb, device):
     return lab
 
 
-def _density_split(idx, bev, cfg):
+def _density_split(idx, bev, cfg, w=None):
     """Split one connected crowd at density valleys (mode seeking on a smoothed BEV density map).
 
     People are splatted on a cell grid and smoothed with a Gaussian (split_sigma m). Every cell climbs to its
@@ -176,6 +197,7 @@ def _density_split(idx, bev, cfg):
     i.e. a part is kept separate only where the crowd density drops by more than (1 - split_valley) between them.
     Parts smaller than min_people are merged into the neighbour with the highest saddle."""
     P = bev[idx]
+    wp = np.ones(len(idx)) if w is None else w[idx]
     c = cfg.split_cell
     pad = 3 * cfg.split_sigma
     o = P.min(0) - pad
@@ -183,7 +205,7 @@ def _density_split(idx, bev, cfg):
     gz = ((P[:, 1] - o[1]) / c).astype(np.int64)
     H, W = int(gz.max() + pad / c) + 2, int(gx.max() + pad / c) + 2
     D = np.zeros((H, W), np.float32)
-    np.add.at(D, (gz, gx), 1.0)
+    np.add.at(D, (gz, gx), wp.astype(np.float32))
     D = cv2.GaussianBlur(D, (0, 0), cfg.split_sigma / c)
     # steepest-ascent pointer of every cell (8-neighbourhood), then pointer jumping to the peak
     Dp = np.pad(D, 1, constant_values=-1.0)
@@ -235,8 +257,9 @@ def _density_split(idx, bev, cfg):
     lab = np.array([find(int(q)) for q in basin[gz, gx]])
     # small parts -> neighbour with the highest saddle
     while True:
-        ids, cnt = np.unique(lab, return_counts=True)
-        small = ids[cnt < cfg.min_people]
+        ids, inv = np.unique(lab, return_inverse=True)
+        cnt = np.bincount(inv, weights=wp)
+        small = ids[cnt < cfg.min_people - 1e-6]
         if len(small) == 0 or len(ids) == 1:
             break
         q = int(small[0])
@@ -319,23 +342,32 @@ def _disc_mask(pts, radius, origin, cell, shape):
     m = np.zeros(shape, np.uint8)
     c = np.round((pts - origin) / cell).astype(np.int32)
     r = np.maximum(1, np.round(np.broadcast_to(radius, len(pts)) / cell).astype(np.int32))
-    for (x, y), rr in zip(c, r):
+    cr = np.unique(np.concatenate([c, r[:, None]], 1), axis=0)
+    for x, y, rr in cr:
         cv2.circle(m, (int(x), int(y)), int(rr), 1, -1)
     return m
 
 
 def build_clusters(bev, sigma, uv, cam, img_wh, net_wh, cfg: ClusterCfg = ClusterCfg(), device=None):
-    """Cluster labels + per-cluster occupied area, BEV outline and image overlay polygon."""
+    """Single frame: cluster labels + per-cluster occupied area, BEV outline, image polygon and risk level."""
     labels = cluster_people(bev, sigma, cfg, device)
+    groups = [np.flatnonzero(labels == c) for c in range(labels.max() + 1 if len(labels) else 0)]
+    out = _geometry(groups, groups, bev, uv, cam, img_wh, cfg)
+    for c in out:
+        c.rho = c.density
+        c.level = risk_level(c.rho, cfg.risk)
+    return labels, out
+
+
+def _geometry(members, geo, bev_g, uv_g, cam, img_wh, cfg):
+    """Clusters from member indices (current frame) and region point indices into bev_g / uv_g."""
     W, H = img_wh
     out = []
     f_img = (W * 0.5) / math.tan(float(cam[0]) * 0.5)
     drop = max(float(cam[3]) - HEAD_HEIGHT, 0.1)
     k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * round(cfg.close / cfg.cell) + 1,) * 2)
-    for c in range(labels.max() + 1 if len(labels) else 0):
-        mem = np.flatnonzero(labels == c)
-        P = bev[mem]
-        # ---- BEV region
+    for mem, g in zip(members, geo):
+        P = bev_g[g]
         pad = cfg.margin + cfg.close + cfg.cell
         o = P.min(0) - pad
         shape = (int(math.ceil((P[:, 1].max() + pad - o[1]) / cfg.cell)) + 1,
@@ -344,9 +376,9 @@ def build_clusters(bev, sigma, uv, cam, img_wh, net_wh, cfg: ClusterCfg = Cluste
         area = float(m.sum()) * cfg.cell * cfg.cell
         cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         bev_polys = [cv2.approxPolyDP(q, 0.75, True)[:, 0].astype(np.float64) * cfg.cell + o for q in cs if len(q) >= 3]
-        out.append(Cluster(members=mem, area=area, bev_polys=bev_polys, img_polys=[]))
-    _image_polygons(out, uv, bev, f_img, drop, (W, H), cfg)
-    return labels, out
+        out.append(Cluster(members=mem, area=area, bev_polys=bev_polys, img_polys=[], geo=g))
+    _image_polygons(out, uv_g, bev_g, f_img, drop, (W, H), cfg)
+    return out
 
 
 def _image_polygons(clusters, uv, bev, f_img, drop, img_wh, cfg):
@@ -366,7 +398,7 @@ def _image_polygons(clusters, uv, bev, f_img, drop, img_wh, cfg):
     nown = np.zeros((gh, gw), np.uint8)
     regs = []
     for k, c in enumerate(clusters):
-        U, P = uv[c.members], bev[c.members]
+        U, P = uv[c.geo], bev[c.geo]
         rpx = np.clip(f_img * cfg.margin / np.sqrt((P ** 2).sum(1) + drop ** 2), 3.0, 0.25 * max(W, H))
         kc = max(1, int(round(float(np.median(rpx)) / ds)))
         pad = int(math.ceil(rpx.max() / ds)) + kc + 2               # region of interest on the raster
@@ -381,8 +413,8 @@ def _image_polygons(clusters, uv, bev, f_img, drop, img_wh, cfg):
         nown += m
     over = nown > 1
     if over.any():
-        idx = np.concatenate([c.members for c in clusters])
-        lab = np.concatenate([np.full(len(c.members), k) for k, c in enumerate(clusters)])
+        idx = np.concatenate([c.geo for c in clusters])
+        lab = np.concatenate([np.full(len(c.geo), k) for k, c in enumerate(clusters)])
         yy, xx = np.nonzero(over)
         _, nn = cKDTree(uv[idx] / ds).query(np.stack([xx, yy], 1))
         own[yy, xx] = lab[nn]
@@ -391,3 +423,211 @@ def _image_polygons(clusters, uv, bev, f_img, drop, img_wh, cfg):
         cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         c.img_polys = [np.round(cv2.approxPolyDP(q, 0.6, True)[:, 0] * ds).astype(np.int32) for q in cs
                        if len(q) >= 3 and cv2.contourArea(q) >= 2]
+
+
+@dataclass
+class TrackCfg:
+    window: int = 8           # frames pooled for clustering (static camera)
+    anchor_alpha: float = 0.3  # per-frame step of a group centre towards its new position
+    anchor_reach: float = 2.0  # an old centre belongs to a crowd if a crowd point is within this (m)
+    keep: int = 30            # frames an unused group centre is remembered (id comes back if the group does)
+    k_hyst: float = 0.5       # group-count hysteresis, in groups of group_area
+    rho_alpha: float = 0.15   # density smoothing (EMA per frame)
+    level_hyst: float = 0.1   # a level drops only below (1 - level_hyst) x its threshold
+    stick: float = 1.0        # a person changes group only if another centre is this much closer (m)
+    keep_people: float = 4.0  # an existing cluster survives down to this many people (new ones need min_people)
+    relax_nb: float = 0.5     # core test relaxed by this many neighbours for people already in a cluster
+    pool_cell: float = 0.25   # older frames' points are merged per BEV cell (m) before clustering
+    match_px: float = 0.01    # head match to the previous frame: tolerance x image long side
+
+
+class ClusterTracker:
+    """Temporally stable clustering for a static camera (video).
+
+    Per-frame clustering flickers: detections near the threshold come and go, so the core / min_people tests
+    and the size split change from frame to frame. The tracker
+      1. clusters the people of the last `window` frames together, each point weighted 1/window (the core and
+         min_people tests become per-frame averages, the density map is smoother);
+      2. keeps the group centres of the size split between frames: k-means starts from the previous centres,
+         a centre moves at most anchor_alpha of the way per frame, and the number of groups changes only when
+         the occupied area is k_hyst groups beyond it; the centre id is the cluster's track id;
+      3. remembers each person's group (head matched to the previous frame): a person stays in its group unless
+         another centre is `stick` m closer, and existing clusters keep relaxed core / size tests
+         (relax_nb, keep_people), so groups do not blink at the thresholds;
+      4. smooths each tracked cluster's density (EMA) and applies hysteresis to its risk level.
+    Regions are drawn from the pooled points (current and recent heads), current people get the labels."""
+
+    def __init__(self, cfg: ClusterCfg = ClusterCfg(), tcfg: TrackCfg = TrackCfg(), device=None):
+        self.cfg, self.t, self.device = cfg, tcfg, device
+        self.buf = deque(maxlen=tcfg.window)
+        self.anchors = {}          # tid -> [pos (2,), frames unused]
+        self.state = {}            # tid -> [rho, level]
+        self.next_id = 0
+
+    def _new(self, pos):
+        tid, self.next_id = self.next_id, self.next_id + 1
+        self.anchors[tid] = [np.asarray(pos, np.float64).copy(), 0]
+        return tid
+
+    def _owners(self, parts, B):
+        """Part index of every remembered centre (nearest crowd point within anchor_reach), -1 = none."""
+        if not self.anchors or not parts:
+            return {}
+        idx = np.concatenate(parts)
+        pid = np.concatenate([np.full(len(q), k) for k, q in enumerate(parts)])
+        ids = list(self.anchors)
+        dd, nn = cKDTree(B[idx]).query(np.array([self.anchors[a][0] for a in ids]))
+        return {a: (int(pid[j]) if d <= self.t.anchor_reach else -1) for a, d, j in zip(ids, dd, nn)}
+
+    def _split(self, part, B, w, inside, prior):
+        """Groups (point index arrays) and their track ids for one connected part (inside: its old centres)."""
+        cfg, t = self.cfg, self.t
+        P, wp = B[part], w[part]
+        k = 1
+        if cfg.max_extent > 0 and np.ptp(P, 0).max() > cfg.max_extent:
+            k_real = len(np.unique(np.floor(P).astype(np.int64), axis=0)) / cfg.group_area
+            lo, hi = max(2, math.ceil(k_real - t.k_hyst)), max(2, math.ceil(k_real + t.k_hyst))
+            k = int(np.clip(len(inside), lo, hi)) if inside else max(2, math.ceil(k_real))
+            k = max(1, min(k, int(wp.sum() // max(cfg.min_people, 1))))
+        cen_w = (P * wp[:, None]).sum(0) / wp.sum()
+        if k == 1:
+            if inside:
+                tid = min(inside, key=lambda a: ((self.anchors[a][0] - cen_w) ** 2).sum())
+                a = self.anchors[tid][0]
+                a += t.anchor_alpha * (cen_w - a)
+            else:
+                tid = self._new(cen_w)
+            return [part], [tid]
+        ids = list(inside)
+        while len(ids) > k:                               # too many old centres: drop the lightest group
+            lab = ((P[:, None] - np.array([self.anchors[a][0] for a in ids])[None]) ** 2).sum(-1).argmin(1)
+            ids.pop(int(np.argmin(np.bincount(lab, weights=wp, minlength=len(ids)))))
+        C = [self.anchors[a][0].copy() for a in ids]
+        fresh = []
+        while len(C) < k:                                 # new centres: farthest point from the existing ones
+            dmin = ((P[:, None] - np.array(C)[None]) ** 2).sum(-1).min(1) if C else ((P - cen_w) ** 2).sum(1)
+            C.append(P[int(np.argmax(dmin))].copy())
+            fresh.append(len(C) - 1)
+        C = np.array(C)
+        for _ in range(5):                                # weighted k-means from the previous centres
+            lab = ((P[:, None] - C[None]) ** 2).sum(-1).argmin(1)
+            sw = np.bincount(lab, weights=wp, minlength=k)
+            for j in range(k):
+                if sw[j] > 0:
+                    C[j] = (P[lab == j] * wp[lab == j, None]).sum(0) / sw[j]
+        tids = []
+        for j in range(k):
+            if j < len(ids):
+                a = self.anchors[ids[j]][0]
+                a += t.anchor_alpha * (C[j] - a)          # damped move of an old centre
+                tids.append(ids[j])
+            else:
+                tids.append(self._new(C[j]))
+        A = np.array([self.anchors[a][0] for a in tids])
+        D = np.sqrt(((P[:, None] - A[None]) ** 2).sum(-1))
+        pr = prior[part]
+        for j, tid in enumerate(tids):                    # stickiness: own previous group is preferred
+            D[pr == tid, j] -= t.stick
+        lab = D.argmin(1)
+        while True:                                        # groups below min_people join the nearest centre
+            sw = np.bincount(lab, weights=wp, minlength=k)
+            small = [j for j in range(k) if 0 < sw[j] < cfg.min_people - 1e-6]
+            if not small:
+                break
+            j = small[0]
+            dd = ((A - A[j]) ** 2).sum(1)
+            dd[j] = np.inf
+            dd[sw == 0] = np.inf
+            lab[lab == j] = int(np.argmin(dd))
+        return [part[lab == j] for j in range(k) if (lab == j).any()], [tids[j] for j in range(k) if (lab == j).any()]
+
+    def _pool(self):
+        """Current points first (one each, weight 1/K), then the older frames merged per BEV cell."""
+        K = len(self.buf)
+        cur = self.buf[0]
+        n = len(cur["bev"])
+        old = list(self.buf)[1:]
+        B, S, U, T, w = [cur["bev"]], [cur["sigma"]], [cur["uv"]], [cur["prior"]], [np.full(n, 1.0 / K)]
+        if old and sum(len(f["bev"]) for f in old):
+            ob = np.concatenate([f["bev"] for f in old]).reshape(-1, 2)
+            key = np.floor(ob / self.t.pool_cell).astype(np.int64)
+            _, first, inv, cnt = np.unique(key, axis=0, return_index=True, return_inverse=True, return_counts=True)
+            inv = inv.reshape(-1)
+            m = len(cnt)
+
+            def mean(x):
+                x = x.reshape(len(inv), -1)
+                o = np.zeros((m, x.shape[1]))
+                np.add.at(o, inv, x)
+                return o / cnt[:, None]
+            B.append(mean(ob))
+            S.append(mean(np.concatenate([f["sigma"] for f in old]))[:, 0])
+            U.append(mean(np.concatenate([f["uv"] for f in old]).astype(np.float64)))
+            T.append(np.concatenate([f["tid"] for f in old])[first])     # newest occurrence (buffer is newest first)
+            w.append(cnt / K)
+        return (np.concatenate(B).reshape(-1, 2), np.concatenate(S), np.concatenate(U).reshape(-1, 2),
+                np.concatenate(T).astype(np.int64), np.concatenate(w), n)
+
+    def __call__(self, bev, sigma, uv, cam, img_wh):
+        cfg, t = self.cfg, self.t
+        bev, sigma, uv = np.asarray(bev, np.float64).reshape(-1, 2), np.asarray(sigma, np.float64), np.asarray(uv).reshape(-1, 2)
+        prior = -np.ones(len(bev), np.int64)
+        if self.buf and len(self.buf[0]["uv"]) and len(uv):     # previous group of each person (mutual nearest head)
+            pu = self.buf[0]["uv"]
+            d01, j = cKDTree(pu).query(uv)
+            _, i = cKDTree(uv).query(pu)
+            ok = (d01 < t.match_px * max(img_wh)) & (i[j] == np.arange(len(uv)))
+            prior[ok] = self.buf[0]["tid"][j[ok]]
+        prior[(prior >= 0) & ~np.isin(prior, list(self.anchors))] = -1
+        self.buf.appendleft({"bev": bev, "sigma": sigma, "uv": uv, "prior": prior, "tid": -np.ones(len(bev), np.int64)})
+        B, S, U, T, w, n = self._pool()
+        live = np.array([tid for tid, (_, miss) in self.anchors.items() if miss == 0], np.int64)
+        T[~np.isin(T, live)] = -1
+        labels = -np.ones(n, np.int64)
+        groups, tids, used = [], [], set()
+        if len(B) >= 2:
+            d = np.hypot(B[:, 0], B[:, 1])
+            s = np.clip(cfg.rad_k * d * S, 1.0, cfg.rad_max)
+            raw = _dbscan(B, d, s, cfg.eps, cfg.min_nb, self.device, w, np.where(T >= 0, t.relax_nb, 0.0))
+            parts = []
+            for c in np.unique(raw[raw >= 0]):
+                idx = np.flatnonzero(raw == c)
+                need = t.keep_people if (T[idx] >= 0).any() else cfg.min_people
+                if w[idx].sum() >= need - 1e-6:
+                    big = cfg.split_valley < 1.0 and np.ptp(B[idx], 0).max() > cfg.split_extent
+                    parts += _density_split(idx, B, cfg, w) if big else [idx]
+            parts.sort(key=lambda q: -w[q].sum())
+            own = self._owners(parts, B)
+            for k, part in enumerate(parts):
+                g, ti = self._split(part, B, w, [a for a, o in own.items() if o == k], T)
+                for q, tid in zip(g, ti):
+                    if (q < n).any():
+                        groups.append(q)
+                        tids.append(tid)
+                        used.add(tid)
+        for tid in list(self.anchors):
+            if tid in used:
+                self.anchors[tid][1] = 0
+            else:
+                self.anchors[tid][1] += 1
+                if self.anchors[tid][1] > t.keep:
+                    del self.anchors[tid]
+                    self.state.pop(tid, None)
+        order = sorted(range(len(groups)), key=lambda j: -int((groups[j] < n).sum()))
+        groups, tids = [groups[j] for j in order], [tids[j] for j in order]
+        members = [g[g < n] for g in groups]
+        for k, m in enumerate(members):
+            labels[m] = k
+            self.buf[0]["tid"][m] = tids[k]
+        out = _geometry(members, groups, B, U, cam, img_wh, cfg)
+        for c, tid, g in zip(out, tids, groups):
+            c.tid = tid
+            rho_now = float(w[g].sum()) / max(c.area, 1e-6)            # frame-averaged count / pooled area
+            st = self.state.get(tid)
+            if st is None:
+                st = self.state[tid] = [rho_now, risk_level(rho_now, cfg.risk)]
+            else:
+                st[0] += t.rho_alpha * (rho_now - st[0])
+                st[1] = risk_level(st[0], cfg.risk, st[1], t.level_hyst)
+            c.rho, c.level = st
+        return labels, out
