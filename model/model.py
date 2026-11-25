@@ -7,8 +7,9 @@ Design notes:
     First two downsamplings use space-to-depth + conv (no information loss for tiny heads).
   * One ReLU linear-attention block at stride 32 only (global crowd / scene context, cheap).
   * Thin top-down neck P5->P4->P3->P2 with per-pixel scale-selection fusion (softmax weights, not concat).
-  * Point heads: stride 8 (K=4 reference points / cell) and stride 4 (K=1 / cell); density gate picks one
-    head per region (static-shape version of PET's quadtree). In-graph 3x3 max-pool suppression + top-K.
+  * Point heads: stride 8 and stride 4, K=4 reference points per cell each (no NMS); density gate picks one
+    head per region (static-shape version of PET's quadtree). One-to-one training; in dense regions a count head
+    (people per 8x8 block) keeps only that many of the block's 16 slots, so no suppression is needed. Top-K.
   * Camera head: global pooled S5 -> (log-FoV, pitch, roll, log camera height).
   * Per-person head size (log, per stride) -> crowd-based self-calibration of a fixed camera (horizon, height).
   * Per-person metric log-distance + Laplace scale. Lift: gravity-aligned pixel ray; distance = inverse-variance
@@ -162,7 +163,9 @@ class Cfg:
     depths: tuple = (1, 2, 2, 1)             # RepConvs per ELAN in S2..S5
     neck: tuple = (32, 64, 96, 128)          # P2, P3, P4, P5 channels
     k8: int = 4                              # reference points per stride-8 cell
-    topk: int = 8192                         # deploy cap on detections (2048 clipped a 2.4k-person Hajj photo)
+    k4: int = 4                              # reference points per stride-4 cell (1 = old head + 3x3 max-pool NMS)
+    cnt_max: int = 8                         # count head: heads per 8x8 px block, classes 0..cnt_max (k4 > 1 only)
+    topk: int = 16384                        # deploy cap on detections (8192 clipped a dense parade frame with K4=4)
     head_height: float = 1.65
     cam_sigma_deg: float = 1.0               # assumed pitch/roll error of the camera estimate (lower when locked)
     cam_h_relsd: float = 0.10                # relative camera-height error
@@ -217,6 +220,20 @@ class Neck(nn.Module):
         return p2, p3, p4, p5
 
 
+def count_gate(s4, cnt):
+    """Keep, in every 8x8 block, only the n highest-scoring of its 4*k4 dense-head slots, n = argmax of the count
+    head. s4 (B, h4, w4, k4) scores, cnt (B, C, h8, w8) logits. Static shapes: a slot's rank is the number of slots in its block that beat it (ties by index), so
+    no sort op is needed (TensorRT only takes a constant K in TopK)."""
+    B, h4, w4, k = s4.shape
+    h8, w8 = h4 // 2, w4 // 2
+    n = cnt.argmax(1)                                                       # B, h8, w8
+    b = s4.reshape(B, h8, 2, w8, 2, k).permute(0, 1, 3, 2, 4, 5).reshape(B, h8, w8, 4 * k)
+    i = torch.arange(4 * k, device=b.device)
+    rank = ((b[..., None, :] > b[..., :, None]) | ((b[..., None, :] == b[..., :, None]) & (i < i[:, None]))).sum(-1)
+    b = b * (rank < n[..., None]).to(b.dtype)
+    return b.reshape(B, h8, w8, 2, 2, k).permute(0, 1, 3, 2, 4, 5).reshape(B, h4, w4, k)
+
+
 class CodeNet(nn.Module):
     def __init__(self, cfg: Cfg | str = "s"):
         super().__init__()
@@ -228,7 +245,10 @@ class CodeNet(nn.Module):
         self.neck = Neck(cfg)
         # point heads
         self.h8 = nn.Sequential(RepConv(n[1], n[1]), nn.Conv2d(n[1], cfg.k8 * 4, 1))   # per ref: logit, dx, dy, log(size/8)
-        self.h4 = nn.Sequential(RepConv(n[0], n[0]), nn.Conv2d(n[0], 4, 1))     # logit, dx, dy, log(size/4)
+        self.h4 = nn.Sequential(RepConv(n[0], n[0]), nn.Conv2d(n[0], cfg.k4 * 4, 1))   # per ref: logit, dx, dy, log(size/4)
+        # count head (stride 8): how many of the 4*k4 dense-head slots in each 8x8 block are people; decoding keeps
+        # only that many (highest scores), so a dense texture cannot light a regular lattice of slots
+        self.cnt8 = nn.Sequential(RepConv(n[1], n[1] // 2), nn.Conv2d(n[1] // 2, cfg.cnt_max + 1, 1)) if cfg.k4 > 1 else None
         self.gate = nn.Sequential(RepConv(n[1], n[1] // 2), nn.Conv2d(n[1] // 2, 1, 1))  # P(dense) per s8 cell
         # per-person geometry at stride 8: (log metric distance camera->head, log Laplace scale)
         self.pgeo = nn.Sequential(RepConv(n[1], n[1] // 2), nn.Conv2d(n[1] // 2, 2, 1))
@@ -317,7 +337,8 @@ class CodeNet(nn.Module):
         p2, p3, _, _ = self.neck(c2, c3, c4, c5)
         k8 = self.cfg.k8
         o8 = self.h8(p3)                                     # B, k8*3, H/8, W/8
-        o4 = self.h4(p2)                                     # B, 3,    H/4, W/4
+        k4 = self.cfg.k4
+        o4 = self.h4(p2)                                     # B, k4*4, H/4, W/4
         gate_logit = self.gate(p3)                           # B, 1,    H/8, W/8
         gate = torch.sigmoid(gate_logit)
         pg = self.pgeo(p3)                                   # B, 2,    H/8, W/8
@@ -325,15 +346,16 @@ class CodeNet(nn.Module):
 
         h8, w8, h4, w4 = o8.shape[2], o8.shape[3], o4.shape[2], o4.shape[3]
         o8 = o8.reshape(B, k8, 4, h8, w8).permute(0, 3, 4, 1, 2)            # B,h8,w8,k8,4
-        o4 = o4.permute(0, 2, 3, 1)                                         # B,h4,w4,4
+        o4 = o4.reshape(B, k4, 4, h4, w4).permute(0, 3, 4, 1, 2)            # B,h4,w4,k4,4
         a8 = self._anchors(h8, w8, 8, k8, img.device)
-        a4 = self._anchors(h4, w4, 4, 1, img.device)[:, :, 0]
+        a4 = self._anchors(h4, w4, 4, k4, img.device)
         pts8 = a8 + o8[..., 1:3] * 8.0
         pts4 = a4 + o4[..., 1:3] * 4.0
         lsz8 = o8[..., 3] + math.log(8.0)                                   # log head size (input pixels)
         lsz4 = o4[..., 3] + math.log(4.0)
+        cnt = self.cnt8(p3) if self.cnt8 is not None else None             # B, cnt_max+1, H/8, W/8
         if not self.deploy:
-            return {"logit8": o8[..., 0], "pts8": pts8, "logit4": o4[..., 0], "pts4": pts4,
+            return {"logit8": o8[..., 0], "pts8": pts8, "logit4": o4[..., 0], "pts4": pts4, "cnt8": cnt,
                     "gate": gate[:, 0], "gate_logit": gate_logit[:, 0], "pgeo": pg, "cam": cam,
                     "lsize8": lsz8, "lsize4": lsz4,
                     "aux_depth": self.aux_depth(p3)[:, 0], "aux_up": self.aux_up(p3),
@@ -342,16 +364,37 @@ class CodeNet(nn.Module):
         # ---------------- deploy: static-shape decoding, all in graph
         g8 = (gate[:, 0] > 0.5).float()                                     # hard gate per s8 cell
         s8 = torch.sigmoid(o8[..., 0]) * (1.0 - g8)[..., None]
-        s4 = torch.sigmoid(o4[..., 0])
-        s4 = s4 * (s4 == F.max_pool2d(s4[:, None], 3, 1, 1)[:, 0]).float()  # local-max suppression
-        s4 = s4 * F.interpolate(g8[:, None], size=(h4, w4), mode="nearest")[:, 0]
+        s4 = torch.sigmoid(o4[..., 0])                                      # B,h4,w4,k4
+        if k4 == 1:                                                         # legacy head: local-max suppression
+            s4 = s4 * (s4 == F.max_pool2d(s4.permute(0, 3, 1, 2), 3, 1, 1).permute(0, 2, 3, 1)).float()
+        else:
+            s4 = count_gate(s4, cnt)
+        s4 = s4 * F.interpolate(g8[:, None], size=(h4, w4), mode="nearest")[:, 0, :, :, None]
         pg8 = pg.permute(0, 2, 3, 1)                                        # B,h8,w8,2
         pg8k = pg8[:, :, :, None, :].expand(B, h8, w8, k8, 2)
-        pg4 = F.interpolate(pg, size=(h4, w4), mode="nearest").permute(0, 2, 3, 1)
-        scores = torch.cat([s8.reshape(B, -1), s4.reshape(B, -1)], 1)
-        pts = torch.cat([pts8.reshape(B, -1, 2), pts4.reshape(B, -1, 2)], 1)
-        lsz = torch.cat([lsz8.reshape(B, -1), lsz4.reshape(B, -1)], 1)
-        geo = torch.cat([pg8k.reshape(B, -1, 2), pg4.reshape(B, -1, 2)], 1)
+        if k4 == 1:
+            pg4 = F.interpolate(pg, size=(h4, w4), mode="nearest").permute(0, 2, 3, 1)[:, :, :, None, :]
+            scores = torch.cat([s8.reshape(B, -1), s4.reshape(B, -1)], 1)
+            pts = torch.cat([pts8.reshape(B, -1, 2), pts4.reshape(B, -1, 2)], 1)
+            lsz = torch.cat([lsz8.reshape(B, -1), lsz4.reshape(B, -1)], 1)
+            geo = torch.cat([pg8k.reshape(B, -1, 2), pg4.reshape(B, -1, 2)], 1)
+        else:
+            # per 8x8 block, the sparse slots (k8) and the dense slots (4*k4) exclude each other (gate) and at most
+            # cnt_max dense slots are non-zero (count gate): keep the block's top max(k8, cnt_max) before the global
+            # top-K, which then sorts as few candidates as the K=1 head (a large TensorRT TopK is the slow part)
+            def blk(t):                                                     # B,h4,w4,k4,... -> B,h8,w8,4*k4,...
+                r = t.shape[4:]
+                t = t.reshape(B, h8, 2, w8, 2, k4, *r).permute(0, 1, 3, 2, 4, 5, *range(6, 6 + len(r)))
+                return t.reshape(B, h8, w8, 4 * k4, *r)
+            sc = torch.cat([s8, blk(s4)], 3)
+            pt = torch.cat([pts8, blk(pts4)], 3)
+            ls = torch.cat([lsz8, blk(lsz4)], 3)
+            m = max(k8, self.cfg.cnt_max)
+            sc, j = torch.topk(sc, m, dim=3)
+            scores = sc.reshape(B, -1)
+            pts = torch.gather(pt, 3, j[..., None].expand(-1, -1, -1, -1, 2)).reshape(B, -1, 2)
+            lsz = torch.gather(ls, 3, j).reshape(B, -1)
+            geo = pg8[:, :, :, None, :].expand(B, h8, w8, m, 2).reshape(B, -1, 2)
         top, idx = torch.topk(scores, self.cfg.topk, dim=1)
         uv = torch.gather(pts, 1, idx[..., None].expand(-1, -1, 2))
         gg = torch.gather(geo, 1, idx[..., None].expand(-1, -1, 2))

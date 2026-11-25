@@ -2,11 +2,12 @@
 
 **CoDE-Net (Crowd of Depth Estimation Net)**: every person's metric position on the ground from a single
 uncalibrated RGB frame. Heads, camera (FoV, tilt, height) and per-person distance come out of one forward pass;
-people are then grouped into crowd clusters with area, density and a risk level (safe / caution / warning).
+a ground-plane density map then gives crowd zones with area, density and a risk level (safe / caution / warning).
 
-- 4.74M parameters
-- 189 FPS (TensorRT FP16, 1280x704, 24 GB GPU); 18-50 FPS end-to-end in PyTorch incl. clustering
+- 4.78M parameters
+- 181 FPS (TensorRT FP16, 1280x704, 24 GB GPU); 16-45 FPS end-to-end in PyTorch incl. zones
 - No calibration, homography or per-site setup
+- Dense crowds: 4 points per 4x4 px cell and a per-block head count instead of non-maximum suppression
 
 ## Architecture
 
@@ -21,7 +22,7 @@ people are then grouped into crowd clusters with area, density and a risk level 
 ├── model/model.py             CoDE-Net
 ├── infer/
 │   ├── infer.py               inference class / CLI (image, folder, video)
-│   ├── postprocess.py         BEV clustering, polygons, area / density
+│   ├── postprocess.py         BEV density field, crowd zones, polygons
 │   ├── visualize.py           overlay and top-view rendering
 │   └── ckpt_crypto.py         encrypted checkpoint loader
 ├── checkpoints/codenet_m.pth.enc
@@ -48,20 +49,21 @@ export CKPT_KEY=<key>
 
 ```bash
 cd infer
-python infer.py image.jpg --out out/                  # overlay | top view (.jpg) + people / clusters (.json)
-python infer.py video.mp4 --out out/ --fixed-camera   # static camera: median camera + temporally stable clusters
-python infer.py video.mp4 --out out/ --risk 2 4       # density thresholds (people/m2) for caution / warning
+python infer.py image.jpg --out out/                  # overlay | top view (.jpg) + people / zones (.json)
+python infer.py video.mp4 --out out/ --fixed-camera   # static camera: median camera + time-smoothed zones
+python infer.py video.mp4 --out out/ --risk 2 4       # local density (people/m2) for caution / warning
 ```
 
-Cluster colours: green < 2, yellow 2-4, red >= 4 people/m2. For a static camera (`--fixed-camera` or `--camera`) the
-clusters are tracked: the last 8 frames are clustered together, group centres persist with a track id, and density
-and risk level are smoothed with hysteresis (`--no-track` to disable; not for moving cameras).
+Zones are regions where the local density (people within ~1 m, on the ground plane) is at least 1 person/m2 (green);
+areas inside them at 2-4 people/m2 are yellow and at >= 4 red, and a zone's level is its highest colour. A continuous
+crowd stays one zone. For a static camera (`--fixed-camera` or `--camera`) the density map is averaged over time and
+levels change with hysteresis (`--no-smooth` to disable; not for moving cameras).
 
 ```python
 from infer import CodeNetPredictor
 
 pred = CodeNetPredictor('../checkpoints/codenet_m.pth.enc')
-res = pred(bgr)     # uv (px), bev (m), camera, labels, clusters (count, area m2, density, level, polygons)
+res = pred(bgr)     # uv (px), bev (m), camera, labels, zones (count, area m2, mean / peak density, level, polygons)
 ```
 
 ## Results
@@ -78,9 +80,9 @@ Videos (5 s): [parade input](results/videos/parade_aerial_input.mp4) /
 
 | | Value |
 |---|---|
-| Params | 4.74M |
-| Speed (TensorRT FP16, 1280x704) | 189 FPS |
-| Head F1 (unseen CCTV / FDST / SHB / SHA / JHU) | 0.83 / 0.89 / 0.81 / 0.73 / 0.68 |
+| Params | 4.78M |
+| Speed (TensorRT FP16, 1280x704) | 181 FPS |
+| Head F1 (unseen CCTV / FDST / SHB / SHA / JHU) | 0.825 / 0.887 / 0.813 / 0.725 / 0.712 |
 
 ## Distance vs camera height
 
@@ -89,7 +91,7 @@ binned by camera height:
 
 | Camera height | 0-10 m | 10-20 m | 20-40 m | 40-70 m | 70-200 m |
 |---|---|---|---|---|---|
-| Distance error | 25.5 % | 30.3 % | 34.9 % | 13.8 % | 40.9 % |
+| Distance error | 27.9 % | 31.8 % | 31.7 % | 12.7 % | 12.5 % |
 
 Flat ground is assumed: people on rooftops, balconies or tiered seating get a wrong top-view position.
 
